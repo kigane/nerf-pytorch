@@ -13,6 +13,8 @@ to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
 # Positional encoding (section 5.1)
 class Embedder:
+    """位置编码
+    """
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.create_embedding_fn()
@@ -22,6 +24,7 @@ class Embedder:
         d = self.kwargs['input_dims']
         out_dim = 0
         if self.kwargs['include_input']:
+            # embed_fns = [lambda x : x]
             embed_fns.append(lambda x : x)
             out_dim += d
             
@@ -42,10 +45,23 @@ class Embedder:
         self.out_dim = out_dim
         
     def embed(self, inputs):
+        # inputs [B...3] => [B...3(2*L+1)]
+        # [x, sin(x*freq1), cos(x*freq1), sin(x*freq2), cos....]  
+        # x 可有可无
+        #? 没乘以PI。可乘可不乘，只要频率有变化即可。
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
 
 def get_embedder(multires, i=0):
+    """构造编码函数 dim(x)->dim(x)*(2L+1)
+
+    Args:
+        multires (int): L
+        i (int, optional): i=-1时，不做任何编码. Defaults to 0.
+
+    Returns:
+        embed_fn, embed_fn_output_dim
+    """
     if i == -1:
         return nn.Identity(), 3
     
@@ -65,8 +81,24 @@ def get_embedder(multires, i=0):
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-        """ 
+    def __init__(self, 
+                D=8, 
+                W=256, 
+                input_ch=3, 
+                input_ch_views=3, 
+                output_ch=4, 
+                skips=[4], 
+                use_viewdirs=False):
+        """NeRF模型
+
+        Args:
+            D (int, optional): MLP深度. Defaults to 8.
+            W (int, optional): MLP隐藏层宽度. Defaults to 256.
+            input_ch (int, optional): 输入通道数x=(x,y,z). Defaults to 3. 63
+            input_ch_views (int, optional): d=. Defaults to 3. 27
+            output_ch (int, optional): 输出通道数r,g,b,sigma. Defaults to 4.
+            skips (list, optional): 在第4层MLP中再次concat上xyz的位置编码. Defaults to [4].
+            use_viewdirs (bool, optional): 是否使用方向参数. Defaults to False.
         """
         super(NeRF, self).__init__()
         self.D = D
@@ -162,14 +194,21 @@ def get_rays(H, W, K, c2w):
     return rays_o, rays_d
 
 
-def get_rays_np(H, W, K, c2w):
+def get_rays_np(H, W, K, c2w): # c2w 是相机位姿矩阵,最后一行已经去掉了。shape=(3,4)
+    
+    # i, j 的shapp=(H, W)
     i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+    # 计算viewpoint到所有像素点向方向，在用c2w矩阵变换到世界坐标中(将相机摆正)。 左手系 
+    # (i-0.5W)/focal,-(j-0.5H)/focal, -1
+    # dirs = np.stack([(i-W*0.5)/focal, -(j-H*0.5)/focal, -np.ones_like(i)], -1)
+    #      = np.stack([(i-W*0.5), -(j-H*0.5), -np.ones_like(i)*focal], -1)
     dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
-    return rays_o, rays_d
+    #! rays_d没有归一化
+    return rays_o, rays_d # (H*W, 3), (H*W, 3)
 
 
 def ndc_rays(H, W, focal, near, rays_o, rays_d):

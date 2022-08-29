@@ -37,10 +37,12 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
+    # inputs=[B,SamplePoints,Coords]
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
+        # x.shape=[2,3] => x[:,None].shape=[2,1,3]
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
@@ -53,8 +55,10 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
+       chunk=一个批次中的像素个数*每根光线上的部分采样点个数
     """
     all_ret = {}
+    # (N_rand, 3+3+1+1#+3)
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
@@ -114,13 +118,13 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1,3]).float()
-    rays_d = torch.reshape(rays_d, [-1,3]).float()
-
+    rays_o = torch.reshape(rays_o, [-1,3]).float() # (N_rand, 3)
+    rays_d = torch.reshape(rays_d, [-1,3]).float() # (N_rand, 3)
+    # (N_rand, 1), (N_rand, 1)
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    rays = torch.cat([rays_o, rays_d, near, far], -1) # (N_rand, 3+3+1+1)
     if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+        rays = torch.cat([rays, viewdirs], -1) # (N_rand, 3+3+1+1+3)
 
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
@@ -178,26 +182,31 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    # x,y,z 的位置编码函数，和输出的编码向量的维度。 args.multires=L=10|4, 仅args.i_embed=-1时不使用位置编码
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
     embeddirs_fn = None
     if args.use_viewdirs:
+        # theta, phi
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
+    # coarse model
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
     grad_vars = list(model.parameters())
 
     model_fine = None
+    # fine model
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
 
+    # 输出camera ray上所有采样点的(r,g,b,sigma)
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
@@ -272,15 +281,20 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
+    # alpha=1-exp{-delta*sigma} # sigma 不能是负的， delta是两个相邻采样点之间的距离
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
+    # 计算相邻采样点之间的距离。后-前，最后一个位置补1e10
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
+    #? ??
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
     noise = 0.
+
+    # 对alpha做扰动，起类似正则的作用。
     if raw_noise_std > 0.:
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
 
@@ -292,11 +306,19 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    # 计算每根ray上的transmittance,即(1-alpha_1)(1-alpha2_2)...(1-alpha_{n-1})
+    weights = alpha * torch.cumprod( 
+        # 第一个采样点的transmittance定义为1
+        torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1
+    )[:, :-1]
+    # rgb_map = reduce(rearrange(weights, 'n1 n2 -> n1 n2 1')*rgb, 'n1 n2 3 -> n1 3')
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
+    # 估计深度图，即距离
     depth_map = torch.sum(weights * z_vals, -1)
+    # disparity是深度的倒数
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
+    # 累积的opacity，为0表示该像素透明，为1表示有颜色。 
     acc_map = torch.sum(weights, -1)
 
     if white_bkgd:
@@ -348,28 +370,29 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
-    N_rays = ray_batch.shape[0]
+    N_rays = ray_batch.shape[0] 
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
+    # t在[0,1]内均匀采样  N_samples=64?
     t_vals = torch.linspace(0., 1., steps=N_samples)
-    if not lindisp:
+    if not lindisp: # [2, 6]内线性采样
         z_vals = near * (1.-t_vals) + far * (t_vals)
-    else:
+    else: # [2, 6]内非线性采样
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
     z_vals = z_vals.expand([N_rays, N_samples])
 
-    if perturb > 0.:
+    if perturb > 0.: # 论文中提到的NeRF是连续隐式函数表示的优点，不是必须等间距离散采样。
         # get intervals between samples
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
         # stratified samples in those intervals
         t_rand = torch.rand(z_vals.shape)
-
+              
         # Pytest, overwrite u with numpy's fixed random numbers
         if pytest:
             np.random.seed(0)
@@ -378,6 +401,10 @@ def render_rays(ray_batch,
 
         z_vals = lower + (upper - lower) * t_rand
 
+    # ray = o + td
+    # rays_o (N_rays, 3)            -> (N_rays, 1, 3) 
+    # rays_d (N_rays, 3)            -> (N_rays, 1, 3) 
+    # z_vals (N_rays, N_samples)    -> (N_rays, N_samples, 1) 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
@@ -390,6 +417,7 @@ def render_rays(ray_batch,
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        # 重要性采样
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
         z_samples = z_samples.detach()
 
@@ -567,15 +595,19 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
+        # 图片，位姿，固定渲染位姿？，宽高焦距，训练测试集索引
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
-        near = 2.
-        far = 6.
+        near = 2.   # t_n
+        far = 6.    # t_f    
 
-        if args.white_bkgd:
+        if args.white_bkgd: # 为加载的图像添加白色背景
+            # images.shape (400, h=800, w=800, 4)
+            # images[...,-1] = 1 (opaque) | 0 (transparent)
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+            # # images.shape (400, h=800, w=800, 3)
         else:
             images = images[...,:3]
 
@@ -637,7 +669,9 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, \
+        start, grad_vars, optimizer = create_nerf(args)
+
     global_step = start
 
     bds_dict = {
@@ -672,7 +706,7 @@ def train():
             return
 
     # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
+    N_rand = args.N_rand 
     use_batching = not args.no_batching
     if use_batching:
         # For random ray batching
